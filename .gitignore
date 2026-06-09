@@ -1,0 +1,42 @@
+# Credentials — never commit these
+.env
+operator.env
+credentials/
+
+# One-off scripts used for specific data tasks — not part of the tool
+ankit_split.py
+ankit_diagnose.py
+ankit_check_sources.py
+hetzner_to_drive.py
+hetzner_copy.py
+hetzner_rearrange.py
+
+# OAuth client secret files (keep in credentials/ instead)
+client_secret_*.json
+
+# Data and state files
+getmega_files/
+pending_count.txt
+pending_files.txt
+shard0_mac.txt
+shard1_windows.txt
+
+# State DB — copy separately via scp
+*.db
+*.db-shm
+*.db-wal
+
+# Logs and runtime artifacts
+transfer.log
+nohup.out
+skipped_files.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / tooling
+.DS_Store
+.claude/

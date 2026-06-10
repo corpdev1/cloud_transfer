@@ -348,7 +348,6 @@ def run_user_wizard():
             success(f"Found: {local_source_dir}")
 
     elif "service account" in source:
-        source_type = "service_account"
         blank()
         info("A service account key lets the tool access your organization's Google Drive")
         info("without individual browser logins.")
@@ -363,9 +362,59 @@ def run_user_wizard():
         if not os.path.exists(sa_file):
             warn(f"File not found: {sa_file} — save it there before running enumerate.")
         user_env["GDRIVE_SERVICE_ACCOUNT_FILE"] = sa_file
-        impersonate = ask("Email to impersonate for workspace-wide access (optional, press Enter to skip)")
-        if impersonate.strip():
-            user_env["GDRIVE_IMPERSONATE_USER"] = impersonate.strip()
+
+        blank()
+        scope = choose("How many users' Drives are you transferring?", [
+            "Single user — impersonate one specific email",
+            "Multiple users — enumerate several workspace accounts",
+        ])
+
+        if "Multiple users" in scope:
+            source_type = "workspace"
+            blank()
+            info("You need a super-admin email so the tool can list all Workspace accounts")
+            info("and impersonate each one. The admin account itself is never transferred.")
+            blank()
+            admin_email = ask("Super-admin email (e.g. admin@yourcompany.com)")
+            if admin_email.strip():
+                user_env["WORKSPACE_ADMIN_USER"] = admin_email.strip()
+
+            blank()
+            if confirm("Run 'list-users' now to discover all user emails?"):
+                _write_env_file(".env", {**user_env})
+                blank()
+                result = subprocess.run(
+                    [sys.executable, "main.py", "list-users",
+                     "--admin", admin_email.strip()],
+                    capture_output=False,
+                )
+                blank()
+                if result.returncode != 0:
+                    warn("list-users failed — check your service account and admin email.")
+                    warn("You can set WORKSPACE_USERS manually in .env after setup.")
+                else:
+                    raw = ask(
+                        "Paste the emails to transfer, comma-separated\n"
+                        "  (or press Enter to set WORKSPACE_USERS in .env later)"
+                    ).strip()
+                    if raw:
+                        emails = ",".join(e.strip() for e in raw.replace(" ", ",").split(",") if e.strip())
+                        user_env["WORKSPACE_USERS"] = emails
+                        success(f"{len(emails.split(','))} user(s) configured.")
+            else:
+                blank()
+                info("You can populate WORKSPACE_USERS in .env later, or pass --users on the CLI:")
+                info("  python main.py enumerate --users alice@co.com bob@co.com ...")
+                raw = ask("Enter emails now, comma-separated (or press Enter to skip)").strip()
+                if raw:
+                    emails = ",".join(e.strip() for e in raw.replace(" ", ",").split(",") if e.strip())
+                    user_env["WORKSPACE_USERS"] = emails
+                    success(f"{len(emails.split(','))} user(s) configured.")
+        else:
+            source_type = "service_account"
+            impersonate = ask("Email to impersonate (optional, press Enter to skip)")
+            if impersonate.strip():
+                user_env["GDRIVE_IMPERSONATE_USER"] = impersonate.strip()
 
     else:
         # OAuth
@@ -414,6 +463,22 @@ def run_user_wizard():
         blank()
         print(f"  {_c(CYAN, 'python main.py transfer')}")
         info("    starts uploading — safe to stop and resume any time")
+    elif source_type == "workspace":
+        print(f"  {_c(CYAN, 'python main.py list-users')}")
+        info("    lists all Workspace user emails (uses WORKSPACE_ADMIN_USER from .env)")
+        blank()
+        if user_env.get("WORKSPACE_USERS"):
+            print(f"  {_c(CYAN, 'python main.py enumerate')}")
+            info("    walks every configured user's Drive  (reads WORKSPACE_USERS from .env)")
+        else:
+            print(f"  {_c(CYAN, 'python main.py enumerate --users')} user1@co.com user2@co.com ...")
+            info("    or set WORKSPACE_USERS=email1,email2,... in .env and run: python main.py enumerate")
+        blank()
+        print(f"  {_c(CYAN, 'python main.py status')}")
+        info("    shows how many files were found across all users")
+        blank()
+        print(f"  {_c(CYAN, 'python main.py transfer')}")
+        info("    starts uploading — safe to stop and resume any time")
     else:
         print(f"  {_c(CYAN, 'python main.py list-drives')}")
         info("    shows all Google Drive folders you have access to")
@@ -447,6 +512,9 @@ def run_user_wizard():
                     subprocess.run([sys.executable, "main.py", "transfer"])
             else:
                 warn("No files found to transfer. Check the folder path and try again.")
+    elif source_type == "workspace":
+        if confirm("Run list-users now to verify your service account can see all users?"):
+            subprocess.run([sys.executable, "main.py", "list-users"])
     elif source_type in ("oauth", "service_account"):
         if confirm("Verify your Google Drive connection now (list-drives)?"):
             subprocess.run([sys.executable, "main.py", "list-drives"])

@@ -169,6 +169,22 @@ class StateManager:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_stats_by_owner(self) -> dict:
+        """Return {owner: {status: {count, bytes}}} grouped by owner."""
+        rows = self._conn().execute(
+            "SELECT owner, status, COUNT(*) as cnt, COALESCE(SUM(size), 0) as bytes "
+            "FROM files GROUP BY owner, status"
+        ).fetchall()
+        result: dict = {}
+        for row in rows:
+            owner = row["owner"] or "(no owner)"
+            if owner not in result:
+                result[owner] = {s: {"count": 0, "bytes": 0} for s in ("pending", "in_progress", "done", "failed")}
+            st = row["status"]
+            if st in result[owner]:
+                result[owner][st] = {"count": row["cnt"], "bytes": row["bytes"]}
+        return result
+
     def get_stats(self) -> dict:
         rows = self._conn().execute(
             "SELECT status, COUNT(*) as count, COALESCE(SUM(size), 0) as bytes FROM files GROUP BY status"

@@ -250,18 +250,22 @@ def cmd_enumerate(args, config: Config):
     """Walk Drive and populate the state DB with every file."""
     _validate(config, need_drive=True, need_sftp=False)
 
-    drive = _make_drive_client(config)
-    try:
-        drive.authenticate()
-    except Exception as e:
-        _handle_drive_error(e, "authenticate")
-        sys.exit(1)
+    # Build the file iterator — folder, selected drives, workspace users, or everything
+    folder_arg      = getattr(args, "folder", None)
+    selected_drives = getattr(args, "drives", None) or []
+    workspace_users = getattr(args, "users", None) or config.workspace_users
+
+    # In workspace mode each user gets their own impersonating client — skip the default one.
+    drive = None
+    if not workspace_users:
+        drive = _make_drive_client(config)
+        try:
+            drive.authenticate()
+        except Exception as e:
+            _handle_drive_error(e, "authenticate")
+            sys.exit(1)
 
     state = StateManager(config.state_db)
-
-    # Build the file iterator — folder, selected drives, or everything
-    folder_arg   = getattr(args, "folder", None)
-    selected_drives = getattr(args, "drives", None) or []
 
     if folder_arg:
         # Accept full URL or bare ID
@@ -281,60 +285,102 @@ def cmd_enumerate(args, config: Config):
                     logger.info(f"  Scanning Shared Drive: {d['name']}")
                     yield from drive.list_drive_files(d["id"], d["name"])
         file_source = _file_iter()
+    elif workspace_users:
+        if not config.service_account_file:
+            print("\nError: --users / WORKSPACE_USERS requires GDRIVE_SERVICE_ACCOUNT_FILE.")
+            print("  Set up a service account with domain-wide delegation, then set:")
+            print("  GDRIVE_SERVICE_ACCOUNT_FILE=path/to/key.json in .env")
+            sys.exit(1)
+        logger.info(f"Workspace enumeration: {len(workspace_users)} user(s): {workspace_users}")
+        def _workspace_iter():
+            for email in workspace_users:
+                logger.info(f"  Enumerating Drive for: {email}")
+                client = GoogleDriveClient(
+                    oauth_client_file=config.oauth_client_file,
+                    token_file=config.oauth_token_file,
+                    service_account_file=config.service_account_file,
+                    impersonate_user=email,
+                )
+                try:
+                    client.authenticate()
+                except Exception as e:
+                    _handle_drive_error(e, f"auth/{email}")
+                    logger.error(f"Skipping {email} — authentication failed")
+                    continue
+                try:
+                    for item in client.list_all_files("root"):
+                        orig_path = item.get("_path", "")
+                        item["_path"] = f"{email}/{orig_path}" if orig_path else email
+                        item["_owner"] = email
+                        yield item
+                except Exception as e:
+                    _handle_drive_error(e, f"enumerate/{email}")
+                    logger.error(f"Skipping {email} — enumeration failed")
+        file_source = _workspace_iter()
     else:
-        logger.info("Enumerating all drives (use --drives or --folder to target specific ones)")
+        logger.info("Enumerating all drives (use --drives, --folder, or --users to target specific ones)")
         file_source = drive.list_all_files(config.gdrive_folder_id)
 
     count = 0
     total_bytes = 0
     skipped = []
 
-    seen_keys: dict[str, str] = {}  # remote_key → file_id, for collision detection
+    # seen_keys tracks remote_key → file_id for collision detection.
+    # Reset whenever the owner changes so it only holds one user's keys at a time —
+    # workspace files are already namespaced by email/ so cross-user collisions can't happen.
+    seen_keys: dict[str, str] = {}
+    current_owner: str | None = None
 
     try:
-        items = list(file_source)
+        for item in file_source:
+            size = int(item.get("size") or 0)
+            mime = item["mimeType"]
+            name = (item.get("name") or "").strip()
+            if not name:
+                logger.warning(f"Skipping file with empty name (id={item.get('id', '?')})")
+                continue
+            path  = item.get("_path", "")
+            owner = item.get("_owner", "")
+
+            if owner != current_owner:
+                current_owner = owner
+                seen_keys = {}
+
+            if not is_exportable(mime):
+                skipped.append({
+                    "name": name,
+                    "path": path,
+                    "mimeType": mime,
+                    "fileId": item["id"],
+                    "driveLink": f"https://drive.google.com/file/d/{item['id']}/view",
+                })
+                continue
+
+            key = _remote_key(path, name, mime)
+            if key in seen_keys:
+                logger.warning(f"Duplicate remote path '{key}' — {item['id']} collides with {seen_keys[key]}, appending file ID")
+                key = key + f"_{item['id']}"
+            seen_keys[key] = item["id"]
+
+            state.upsert_file(DriveFile(
+                file_id=item["id"],
+                name=name,
+                path=path,
+                size=size,
+                mime_type=mime,
+                remote_key=key,
+                owner=owner,
+            ))
+            count += 1
+            total_bytes += size
+
+            if count % 500 == 0:
+                logger.info(f"  {count:,} files enumerated ({_fmt_size(total_bytes)} so far)...")
+
     except Exception as e:
         _handle_drive_error(e, "enumerate")
-        sys.exit(1)
-
-    for item in items:
-        size = int(item.get("size") or 0)
-        mime = item["mimeType"]
-        name = (item.get("name") or "").strip()
-        if not name:
-            logger.warning(f"Skipping file with empty name (id={item.get('id', '?')})")
-            continue
-        path = item.get("_path", "")
-
-        if not is_exportable(mime):
-            skipped.append({
-                "name": name,
-                "path": path,
-                "mimeType": mime,
-                "fileId": item["id"],
-                "driveLink": f"https://drive.google.com/file/d/{item['id']}/view",
-            })
-            continue
-
-        key = _remote_key(path, name, mime)
-        if key in seen_keys:
-            logger.warning(f"Duplicate remote path '{key}' — {item['id']} collides with {seen_keys[key]}, appending file ID")
-            key = key + f"_{item['id']}"
-        seen_keys[key] = item["id"]
-
-        state.upsert_file(DriveFile(
-            file_id=item["id"],
-            name=name,
-            path=path,
-            size=size,
-            mime_type=mime,
-            remote_key=key,
-        ))
-        count += 1
-        total_bytes += size
-
-        if count % 500 == 0:
-            logger.info(f"  {count:,} files enumerated ({_fmt_size(total_bytes)} so far)...")
+        logger.warning(f"Enumeration interrupted after {count:,} files — progress saved to DB.")
+        logger.info("Re-run enumerate to continue; already-saved files won't be duplicated.")
 
     # Write skipped files to JSON so nothing is silently lost.
     skipped_path = "skipped_files.json"
@@ -648,11 +694,52 @@ def cmd_transfer(args, config: Config):
 def cmd_status(args, config: Config):
     """Print a progress table."""
     state = StateManager(config.state_db)
-    stats = state.get_stats()
 
+    if getattr(args, "by_user", False):
+        by_owner = state.get_stats_by_owner()
+        if not by_owner:
+            print("\nNo files in state DB.\n")
+            return
+
+        owners = sorted(by_owner.keys(), key=lambda x: ("~" if x == "(no owner)" else x.lower()))
+        col_w = max(max(len(o) for o in owners), len("USER"))
+
+        def _row(d):
+            # fold in_progress into pending — they reset to pending on next run anyway
+            pending = d["pending"]["count"] + d["in_progress"]["count"]
+            done    = d["done"]["count"]
+            failed  = d["failed"]["count"]
+            total   = pending + done + failed
+            size    = sum(v["bytes"] for v in d.values())
+            pct     = f"{done / total * 100:.1f}%" if total else "—"
+            return pending, done, failed, total, size, pct
+
+        hdr = f"  {'USER':<{col_w}}  {'PENDING':>10}  {'DONE':>10}  {'FAILED':>8}  {'SIZE':>10}  {'DONE%':>6}"
+        sep = "  " + "─" * (len(hdr) - 2)
+        print(f"\nPer-user breakdown — {len(owners)} owner(s)\n")
+        print(hdr)
+        print(sep)
+
+        tot_pend = tot_done = tot_fail = tot_total = tot_bytes = 0
+        for owner in owners:
+            pend, done, fail, total, size, pct = _row(by_owner[owner])
+            print(f"  {owner:<{col_w}}  {pend:>10,}  {done:>10,}  {fail:>8,}  {_fmt_size(size):>10}  {pct:>6}")
+            tot_pend += pend
+            tot_done += done
+            tot_fail += fail
+            tot_total += total
+            tot_bytes += size
+
+        print(sep)
+        overall_pct = f"{tot_done / tot_total * 100:.1f}%" if tot_total else "—"
+        print(f"  {'TOTAL':<{col_w}}  {tot_pend:>10,}  {tot_done:>10,}  {tot_fail:>8,}  {_fmt_size(tot_bytes):>10}  {overall_pct:>6}")
+        print()
+        return
+
+    stats = state.get_stats()
     total_files = sum(v["count"] for v in stats.values())
     total_bytes = sum(v["bytes"] for v in stats.values())
-    done_files = stats["done"]["count"]
+    done_files  = stats["done"]["count"]
 
     print(f"\n{'Status':<15} {'Files':>10} {'Size':>15}")
     print("─" * 42)
@@ -691,6 +778,99 @@ def cmd_show_failed(args, config: Config):
     print()
 
 
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def cmd_list_users(args, config: Config):
+    """List all user emails in the Google Workspace domain via the Admin Directory API."""
+    if not config.service_account_file:
+        print("\nError: list-users requires GDRIVE_SERVICE_ACCOUNT_FILE.")
+        print("  Set GDRIVE_SERVICE_ACCOUNT_FILE=path/to/key.json in .env")
+        sys.exit(1)
+
+    admin_user = args.admin or config.workspace_admin_user
+    if not admin_user:
+        print("\nError: supply --admin admin@yourdomain.com (must be a super admin).")
+        print("  Or set WORKSPACE_ADMIN_USER=admin@yourdomain.com in .env")
+        sys.exit(1)
+
+    if "@" not in admin_user:
+        print(f"\nError: '{admin_user}' doesn't look like an email address.")
+        sys.exit(1)
+    domain = admin_user.split("@", 1)[1]
+
+    try:
+        from google.oauth2 import service_account as _sa
+    except ImportError:
+        print("\nError: google-auth is required.  Run: pip install google-auth")
+        sys.exit(1)
+
+    import google_auth_httplib2
+    import httplib2
+    from googleapiclient.discovery import build
+
+    DIRECTORY_SCOPE = "https://www.googleapis.com/auth/admin.directory.user.readonly"
+    try:
+        creds = _sa.Credentials.from_service_account_file(
+            config.service_account_file, scopes=[DIRECTORY_SCOPE]
+        )
+        creds = creds.with_subject(admin_user)
+        authorized_http = google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http(timeout=60))
+        admin_svc = build("admin", "directory_v1", http=authorized_http, cache_discovery=False)
+    except Exception as e:
+        print(f"\nFailed to build Admin Directory client: {e}")
+        sys.exit(1)
+
+    users = []
+    page_token = None
+    try:
+        while True:
+            resp = admin_svc.users().list(
+                domain=domain,
+                maxResults=500,
+                pageToken=page_token,
+                orderBy="email",
+                fields="nextPageToken,users(primaryEmail,name/fullName,suspended,isAdmin)",
+            ).execute()
+            users.extend(resp.get("users", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+    except Exception as e:
+        msg = str(e)
+        print(f"\nDirectory API error: {e}")
+        if "insufficientPermissions" in msg or "403" in msg:
+            print(f"  → The service account must have domain-wide delegation with scope:")
+            print(f"    {DIRECTORY_SCOPE}")
+            print(f"  → Set it in Google Admin: Security → API Controls → Domain-wide delegation")
+        elif "invalid_grant" in msg:
+            print(f"  → '{admin_user}' may not be a super admin, or DWD is not configured.")
+        sys.exit(1)
+
+    active    = [u for u in users if not u.get("suspended")]
+    suspended = [u for u in users if u.get("suspended")]
+
+    print(f"\nDomain: {domain}   Total: {len(users)}   Active: {len(active)}   Suspended: {len(suspended)}\n")
+    print(f"  {'EMAIL':<45}  {'NAME':<28}  FLAGS")
+    print("  " + "─" * 80)
+    for u in users:
+        email = u.get("primaryEmail", "")
+        name  = (u.get("name") or {}).get("fullName", "")[:28]
+        flags = []
+        if u.get("isAdmin"):
+            flags.append("admin")
+        if u.get("suspended"):
+            flags.append("suspended")
+        print(f"  {email:<45}  {name:<28}  {', '.join(flags)}")
+
+    if active:
+        emails_csv = ",".join(u.get("primaryEmail", "") for u in active)
+        print(f"\n-- Active user emails (paste into .env) --")
+        print(f"WORKSPACE_USERS={emails_csv}")
+        print(f"\n-- Or pass directly to enumerate --")
+        print("python main.py enumerate --users " + " ".join(u.get("primaryEmail", "") for u in active))
+    print()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
@@ -702,11 +882,17 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("list-drives",  help="List all accessible shared drives")
+    p_lu = sub.add_parser("list-users", help="List all Workspace user emails via Admin Directory API")
+    p_lu.add_argument("--admin", metavar="EMAIL",
+                      help="Super-admin email to impersonate (overrides WORKSPACE_ADMIN_USER in .env)")
     p_enum = sub.add_parser("enumerate", help="Walk Drive and populate the state DB")
     p_enum.add_argument("--drives", nargs="+", metavar="DRIVE",
                         help='Drive names or IDs to enumerate. Use "my-drive" for personal files.')
     p_enum.add_argument("--folder",
                         help="Enumerate a specific folder by ID or URL (e.g. https://drive.google.com/drive/.../folders/ID)")
+    p_enum.add_argument("--users", nargs="+", metavar="EMAIL",
+                        help="Workspace user emails to enumerate (requires service account with domain-wide delegation). "
+                             "Overrides WORKSPACE_USERS in .env.")
     p_csv = sub.add_parser("load-csv", help="Load filtered GetMega inventory files into the state DB")
     p_csv.add_argument("--csv-dir", default="getmega_files", help="Directory containing the inventory CSV files (default: getmega_files)")
     p_local = sub.add_parser("enumerate-local", help="Queue a local directory for transfer to Hetzner")
@@ -714,7 +900,9 @@ def main():
     p_transfer = sub.add_parser("transfer", help="Transfer pending files to Hetzner S3")
     p_transfer.add_argument("--shard", type=int, default=None, help="Shard index (0-based) for multi-machine splits")
     p_transfer.add_argument("--total-shards", type=int, default=None, help="Total number of shards (e.g. 2)")
-    sub.add_parser("status",       help="Show transfer progress")
+    p_status = sub.add_parser("status", help="Show transfer progress")
+    p_status.add_argument("--by-user", action="store_true",
+                          help="Break down progress by user/owner (useful for workspace transfers)")
     sub.add_parser("retry-failed", help="Reset failed files back to pending")
     sub.add_parser("show-failed",  help="Print failed files and their error messages")
 
@@ -725,6 +913,7 @@ def main():
 
     {
         "list-drives":  cmd_list_drives,
+        "list-users":   cmd_list_users,
         "enumerate":       cmd_enumerate,
         "enumerate-local": cmd_enumerate_local,
         "load-csv":     cmd_load_csv,

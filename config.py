@@ -27,9 +27,16 @@ class Config:
 
     # Google Drive — Service Account (workspace-wide / super admin)
     # Set GDRIVE_SERVICE_ACCOUNT_FILE to use service account instead of OAuth.
-    # Set GDRIVE_IMPERSONATE_USER to impersonate a workspace user (requires domain-wide delegation).
+    # Set GDRIVE_IMPERSONATE_USER to impersonate a single workspace user.
+    # Set WORKSPACE_USERS to a comma-separated list of emails to enumerate/transfer
+    # multiple users' Drives in one run (requires domain-wide delegation).
     service_account_file: str = field(default_factory=lambda: _env("GDRIVE_SERVICE_ACCOUNT_FILE", ""))
     impersonate_user: str = field(default_factory=lambda: _env("GDRIVE_IMPERSONATE_USER", ""))
+    # WORKSPACE_ADMIN_USER: a super-admin email used by `list-users` to call the Directory API.
+    workspace_admin_user: str = field(default_factory=lambda: _env("WORKSPACE_ADMIN_USER", ""))
+    workspace_users: list = field(default_factory=lambda: [
+        u.strip() for u in _env("WORKSPACE_USERS", "").split(",") if u.strip()
+    ])
 
     # Destination — "sftp" (Hetzner Storage Box) or "s3" (any S3-compatible)
     destination: str = field(default_factory=lambda: _env("DESTINATION", "sftp"))
